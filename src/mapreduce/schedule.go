@@ -35,24 +35,24 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	var wait_group sync.WaitGroup
 	wait_group.Add(ntasks)
 	for taskId := 0; taskId < ntasks; taskId++ {
-		go func(id int) {
+		var taskArgs DoTaskArgs
+		taskArgs.JobName = jobName
+		if phase == mapPhase {
+			taskArgs.File = mapFiles[taskId]
+		}
+		taskArgs.Phase = phase
+		taskArgs.TaskNumber = taskId
+		taskArgs.NumOtherPhase = n_other
+		go func() {
 			defer wait_group.Done()
-			var doTaskArgs DoTaskArgs
-			doTaskArgs.JobName = jobName
-			if phase == mapPhase {
-				doTaskArgs.File = mapFiles[id]
-			}
-			doTaskArgs.Phase = phase
-			doTaskArgs.TaskNumber = id
-			doTaskArgs.NumOtherPhase = n_other
 			callSuccess := false
 			var workerName string
 			for callSuccess == false {
 				workerName = <-registerChan
-				callSuccess = call(workerName, "Worker.DoTask", doTaskArgs, nil)
-				go func() { registerChan <- workerName }()
+				callSuccess = call(workerName, "Worker.DoTask", taskArgs, nil)
 			}
-		}(taskId)
+			go func() { registerChan <- workerName }()
+		}()
 	}
 	wait_group.Wait()
 	//
