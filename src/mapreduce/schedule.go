@@ -1,6 +1,9 @@
 package mapreduce
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 //
 // schedule() starts and waits for all tasks in the given phase (mapPhase
@@ -29,6 +32,29 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// have completed successfully, schedule() should return.
 	//
 	// Your code here (Part III, Part IV).
+	var wait_group sync.WaitGroup
+	wait_group.Add(ntasks)
+	for taskId := 0; taskId < ntasks; taskId++ {
+		go func(id int) {
+			defer wait_group.Done()
+			var doTaskArgs DoTaskArgs
+			doTaskArgs.JobName = jobName
+			if phase == mapPhase {
+				doTaskArgs.File = mapFiles[id]
+			}
+			doTaskArgs.Phase = phase
+			doTaskArgs.TaskNumber = id
+			doTaskArgs.NumOtherPhase = n_other
+			callSuccess := false
+			var workerName string
+			for callSuccess == false {
+				workerName = <-registerChan
+				callSuccess = call(workerName, "Worker.DoTask", doTaskArgs, nil)
+				go func() { registerChan <- workerName }()
+			}
+		}(taskId)
+	}
+	wait_group.Wait()
 	//
 	fmt.Printf("Schedule: %v done\n", phase)
 }
