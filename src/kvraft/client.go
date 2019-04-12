@@ -1,13 +1,20 @@
 package raftkv
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"time"
+)
 
+var clients = make(map[int64]bool)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+
+	lastLeader int64
+	seqid      int64
+	clientid   int64
 }
 
 func nrand() int64 {
@@ -17,10 +24,26 @@ func nrand() int64 {
 	return x
 }
 
+func generateId() int64 {
+	for {
+		x := nrand()
+		if clients[x] {
+			continue
+		}
+		clients[x] = true
+		return x
+	}
+}
+
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+
+	ck.lastLeader = int64(len(servers))
+	ck.seqid = 1
+	ck.clientid = generateId()
+	DPrintf("Clerk: [%d]", ck.clientid)
+
 	return ck
 }
 
@@ -37,8 +60,33 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	DPrintf("Clerk: Get: [%s]\n", key)
+	count := len(ck.servers)
+	for {
+		args := &GetArgs{Key: key, ClientId: ck.clientid, SeqId: ck.seqid}
+		reply := new(GetReply)
 
-	// You will have to modify this function.
+		ck.lastLeader %= int64(count)
+		done := make(chan bool, 1)
+		go func() {
+			ok := ck.servers[ck.lastLeader].Call("KVServer.Get", args, reply)
+			done <- ok
+		}()
+		select {
+		case <-time.After(200 * time.Millisecond): // rpc timeout: 200ms
+			ck.lastLeader++
+			continue
+		case ok := <-done:
+			if ok && !reply.WrongLeader {
+				ck.seqid++
+				if reply.Err == OK {
+					return reply.Value
+				}
+				return ""
+			}
+			ck.lastLeader++
+		}
+	}
 	return ""
 }
 
@@ -53,7 +101,30 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	DPrintf("Clerk: PutAppend: [%q] => (%q,%q) from: [%d]\n", op, key, value, ck.clientid)
+	count := len(ck.servers)
+	for {
+		args := &PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientid, SeqId: ck.seqid}
+		reply := new(PutAppendReply)
+
+		ck.lastLeader %= int64(count)
+		done := make(chan bool, 1)
+		go func() {
+			ok := ck.servers[ck.lastLeader].Call("KVServer.PutAppend", args, reply)
+			done <- ok
+		}()
+		select {
+		case <-time.After(200 * time.Millisecond): // rpc timeout: 200ms
+			ck.lastLeader++
+			continue
+		case ok := <-done:
+			if ok && !reply.WrongLeader && reply.Err == OK {
+				ck.seqid++
+				return
+			}
+			ck.lastLeader++
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
