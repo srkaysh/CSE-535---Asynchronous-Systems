@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -26,8 +27,8 @@ type Op struct {
 }
 
 type LatestReply struct {
-	seqid int64       // Last request
-	reply interface{} // Last reply
+	SeqId int64    // Last request
+	Reply GetReply // Last reply
 }
 
 type KVServer struct {
@@ -38,10 +39,12 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	db         map[string]string
-	notifyChs  map[int]chan struct{}
-	shutdownCh chan struct{}
-	duplicate  map[int64]*LatestReply
+	db            map[string]string
+	notifyChs     map[int]chan struct{}
+	persist       *raft.Persister
+	snapshotIndex int
+	shutdownCh    chan struct{}
+	duplicate     map[int64]*LatestReply
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -55,11 +58,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	kv.mu.Lock()
 	if dup, ok := kv.duplicate[args.ClientId]; ok {
-		if args.SeqId <= dup.seqid {
+		if args.SeqId <= dup.SeqId {
 			kv.mu.Unlock()
 			reply.WrongLeader = false
 			reply.Err = OK
-			reply.Value = dup.reply.(*GetReply).Value
+			reply.Value = dup.Reply.Value
 			return
 		}
 	}
@@ -83,7 +86,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		}
 
 		kv.mu.Lock()
-		delete(kv.notifyChs, index)
 		if value, ok := kv.db[args.Key]; ok {
 			reply.Value = value
 		} else {
@@ -106,7 +108,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	kv.mu.Lock()
 	if dup, ok := kv.duplicate[args.ClientId]; ok {
-		if args.SeqId <= dup.seqid {
+		if args.SeqId <= dup.SeqId {
 			kv.mu.Unlock()
 			reply.WrongLeader = false
 			reply.Err = OK
@@ -125,10 +127,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	select {
 	case <-ch:
-		kv.mu.Lock()
-		delete(kv.notifyChs, index)
-		kv.mu.Unlock()
-
 		curTerm, isLeader := kv.rf.GetState()
 		if !isLeader || term != curTerm {
 			reply.WrongLeader = true
@@ -138,7 +136,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case <-kv.shutdownCh:
 		return
 	}
-
 }
 
 // applyDaemon receive applyMsg from Raft layer, apply to Key-Value state machine
@@ -151,43 +148,96 @@ func (kv *KVServer) applyDaemon() {
 			return
 		case msg, ok := <-kv.applyCh:
 			if ok {
-				cmd := msg.Command.(Op)
-				kv.mu.Lock()
-				switch cmd.Op {
-				case "Get":
-					dup, ok := kv.duplicate[cmd.ClientId]
-					if !ok || dup.seqid < cmd.SeqId {
-						kv.duplicate[cmd.ClientId] = &LatestReply{seqid: cmd.SeqId,
-							reply: &GetReply{Value: kv.db[cmd.Key]}}
-					}
-				case "Put":
-					dup, ok := kv.duplicate[cmd.ClientId]
-					if !ok || dup.seqid < cmd.SeqId {
-						kv.db[cmd.Key] = cmd.Value
-						kv.duplicate[cmd.ClientId] = &LatestReply{seqid: cmd.SeqId, reply: nil}
-					}
-				case "Append":
-					dup, ok := kv.duplicate[cmd.ClientId]
-					if !ok || dup.seqid < cmd.SeqId {
-						kv.db[cmd.Key] += cmd.Value
-						kv.duplicate[cmd.ClientId] = &LatestReply{seqid: cmd.SeqId, reply: nil}
-					}
-				default:
-					DPrintf("[%d]: server [%d] receive invalid cmd: [%v]\n", kv.me, kv.me, cmd)
+				if msg.UseSnapshot {
+					kv.mu.Lock()
+					kv.readSnapshot(msg.Snapshot)
+					kv.generateSnapshot(msg.CommandIndex)
+					kv.mu.Unlock()
+					continue
 				}
+				if msg.Command != nil && msg.CommandIndex > kv.snapshotIndex {
+					cmd := msg.Command.(Op)
+					kv.mu.Lock()
+					if dup, ok := kv.duplicate[cmd.ClientId]; !ok || dup.SeqId < cmd.SeqId {
+						switch cmd.Op {
+						case "Get":
+							kv.duplicate[cmd.ClientId] = &LatestReply{SeqId: cmd.SeqId,
+								Reply: GetReply{Value: kv.db[cmd.Key]}}
+						case "Put":
+							kv.db[cmd.Key] = cmd.Value
+							kv.duplicate[cmd.ClientId] = &LatestReply{SeqId: cmd.SeqId}
+						case "Append":
+							kv.db[cmd.Key] += cmd.Value
+							kv.duplicate[cmd.ClientId] = &LatestReply{SeqId: cmd.SeqId}
+						default:
+							DPrintf("[%d]: server [%d] receive invalid cmd: [%v]\n", kv.me, kv.me, cmd)
+							panic("invalid command operation")
+						}
+						if ok {
+							DPrintf("[%d]: server [%d] apply index: [%d], cmd: [%v] (clientid: [%d], dup seqid: [%d] < [%d])\n",
+								kv.me, kv.me, msg.CommandIndex, cmd, cmd.ClientId, dup.SeqId, cmd.SeqId)
+						}
+					}
 
-				notifyCh := kv.notifyChs[msg.CommandIndex]
-				kv.mu.Unlock()
+					if needSnapshot(kv) {
+						DPrintf("[%d]: server %d need generate snapshot @ %d (%d vs %d), client: %d.\n",
+							kv.me, kv.me, msg.CommandIndex, kv.maxraftstate, kv.persist.RaftStateSize(), cmd.ClientId)
+						kv.generateSnapshot(msg.CommandIndex)
+					}
 
-				_, isLeader := kv.rf.GetState()
-				if isLeader && notifyCh != nil {
-					notifyCh <- struct{}{}
-				} else if notifyCh != nil {
-					close(notifyCh)
+					if notifyCh, ok := kv.notifyChs[msg.CommandIndex]; ok && notifyCh != nil {
+						close(notifyCh)
+						delete(kv.notifyChs, msg.CommandIndex)
+					}
+					kv.mu.Unlock()
 				}
 			}
 		}
 	}
+}
+
+func needSnapshot(kv *KVServer) bool {
+	if kv.maxraftstate < 0 {
+		return false
+	}
+	if kv.maxraftstate < kv.persist.RaftStateSize() {
+		return true
+	}
+	var abs = kv.maxraftstate - kv.persist.RaftStateSize()
+	var threshold = kv.maxraftstate / 10
+	if abs < threshold {
+		return true
+	}
+	return false
+}
+
+func (kv *KVServer) generateSnapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	kv.snapshotIndex = index
+
+	e.Encode(kv.db)
+	e.Encode(kv.snapshotIndex)
+	e.Encode(kv.duplicate)
+
+	data := w.Bytes()
+	kv.rf.PersistAndSaveSnapshot(index, data)
+}
+
+func (kv *KVServer) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	kv.db = make(map[string]string)
+	kv.duplicate = make(map[int64]*LatestReply)
+
+	d.Decode(&kv.db)
+	d.Decode(&kv.snapshotIndex)
+	d.Decode(&kv.duplicate)
 }
 
 //
@@ -197,8 +247,8 @@ func (kv *KVServer) applyDaemon() {
 // turn off debug output from this instance.
 //
 func (kv *KVServer) Kill() {
-	kv.rf.Kill()
 	close(kv.shutdownCh)
+	kv.rf.Kill()
 }
 
 //
@@ -223,15 +273,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.db = make(map[string]string)
 	kv.notifyChs = make(map[int]chan struct{})
+	kv.persist = persister
 
 	kv.shutdownCh = make(chan struct{})
 
 	kv.duplicate = make(map[int64]*LatestReply)
-
+	kv.readSnapshot(kv.persist.ReadSnapshot())
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	go kv.applyDaemon()
 	return kv
 }

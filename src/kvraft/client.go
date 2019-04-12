@@ -12,9 +12,9 @@ var clients = make(map[int64]bool)
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 
-	lastLeader int64
-	seqid      int64
-	clientid   int64
+	leader   int64
+	seqid    int64
+	clientid int64
 }
 
 func nrand() int64 {
@@ -39,7 +39,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 
-	ck.lastLeader = int64(len(servers))
+	ck.leader = int64(len(servers))
 	ck.seqid = 1
 	ck.clientid = generateId()
 	DPrintf("Clerk: [%d]", ck.clientid)
@@ -66,15 +66,15 @@ func (ck *Clerk) Get(key string) string {
 		args := &GetArgs{Key: key, ClientId: ck.clientid, SeqId: ck.seqid}
 		reply := new(GetReply)
 
-		ck.lastLeader %= int64(count)
+		ck.leader %= int64(count)
 		done := make(chan bool, 1)
 		go func() {
-			ok := ck.servers[ck.lastLeader].Call("KVServer.Get", args, reply)
+			ok := ck.servers[ck.leader].Call("KVServer.Get", args, reply)
 			done <- ok
 		}()
 		select {
 		case <-time.After(200 * time.Millisecond): // rpc timeout: 200ms
-			ck.lastLeader++
+			ck.leader++
 			continue
 		case ok := <-done:
 			if ok && !reply.WrongLeader {
@@ -84,7 +84,7 @@ func (ck *Clerk) Get(key string) string {
 				}
 				return ""
 			}
-			ck.lastLeader++
+			ck.leader++
 		}
 	}
 	return ""
@@ -107,22 +107,22 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		args := &PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientid, SeqId: ck.seqid}
 		reply := new(PutAppendReply)
 
-		ck.lastLeader %= int64(count)
+		ck.leader %= int64(count)
 		done := make(chan bool, 1)
 		go func() {
-			ok := ck.servers[ck.lastLeader].Call("KVServer.PutAppend", args, reply)
+			ok := ck.servers[ck.leader].Call("KVServer.PutAppend", args, reply)
 			done <- ok
 		}()
 		select {
 		case <-time.After(200 * time.Millisecond): // rpc timeout: 200ms
-			ck.lastLeader++
+			ck.leader++
 			continue
 		case ok := <-done:
 			if ok && !reply.WrongLeader && reply.Err == OK {
 				ck.seqid++
 				return
 			}
-			ck.lastLeader++
+			ck.leader++
 		}
 	}
 }
